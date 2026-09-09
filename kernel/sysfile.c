@@ -284,6 +284,34 @@ create(char *path, short type, short major, short minor)
 }
 
 uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+  int n;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  if((n = strlen(target)) >= MAXPATH)
+    return -1;
+
+  begin_op(ROOTDEV);
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op(ROOTDEV);
+    return -1;
+  }
+  // Store the link target (a path name) in the symlink inode's data blocks.
+  if(writei(ip, 0, (uint64)target, 0, n) != n){
+    iunlockput(ip);
+    end_op(ROOTDEV);
+    return -1;
+  }
+  iunlockput(ip);
+  end_op(ROOTDEV);
+  return 0;
+}
+
+uint64
 sys_open(void)
 {
   char path[MAXPATH];
@@ -304,6 +332,35 @@ sys_open(void)
       return -1;
     }
   } else {
+    if((ip = namei(path)) == 0){
+      end_op(ROOTDEV);
+      return -1;
+    }
+    ilock(ip);
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op(ROOTDEV);
+      return -1;
+    }
+  }
+
+  // Follow symbolic links unless the caller passed O_NOFOLLOW.
+  for(int depth = 0; ip->type == T_SYMLINK && !(omode & O_NOFOLLOW); depth++){
+    if(depth >= 10){
+      iunlockput(ip);
+      end_op(ROOTDEV);
+      return -1;
+    }
+    // ip is a symbolic link: read the target path from its data.
+    if(ip->size <= 0 || ip->size >= MAXPATH ||
+       readi(ip, 0, (uint64)path, 0, ip->size) != (int)ip->size){
+      iunlockput(ip);
+      end_op(ROOTDEV);
+      return -1;
+    }
+    path[ip->size] = 0;
+    iunlockput(ip);
+
     if((ip = namei(path)) == 0){
       end_op(ROOTDEV);
       return -1;
