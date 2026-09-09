@@ -47,8 +47,17 @@ sys_sbrk(void)
   if(argint(0, &n) < 0)
     return -1;
   addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
+  if(n < 0){
+    // shrink the address space: actually free the pages that are
+    // no longer part of the process (uvmdealloc unmaps them; pages
+    // that were never allocated are simply skipped).
+    myproc()->sz = uvmdealloc(myproc()->pagetable, myproc()->sz, myproc()->sz + n);
+  } else {
+    // grow the address space lazily: only increase the process size.
+    // the pages are allocated on demand by the page-fault handler in
+    // trap.c when the process first touches them.
+    myproc()->sz += n;
+  }
   return addr;
 }
 
