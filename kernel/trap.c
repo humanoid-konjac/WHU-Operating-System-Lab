@@ -67,6 +67,23 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15){
+    // A load (13) or store (15) page fault from user space.
+    //
+    // sbrk() now grows p->sz without allocating the pages, so
+    // touching the new memory for the first time traps here.
+    // If the faulting address is inside the range that sbrk()
+    // promised ([0, p->sz)), allocate the page now and return to
+    // user space to retry the instruction.
+    //
+    // Anything else is an illegal access and kills the process:
+    //  - va >= p->sz: not a lazy address (e.g. after sbrk(-n)),
+    //  - va >= MAXVA: beyond the user address space,
+    //  - lazyalloc() fails: page already mapped (stack guard page,
+    //    read-only page, ...) or out of memory.
+    uint64 va = r_stval();
+    if(va >= p->sz || va >= MAXVA || lazyalloc(va) < 0)
+      p->killed = 1;
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
