@@ -67,6 +67,18 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 15) {
+    // 15: store/AMO page fault.  With copy-on-write fork, shared
+    // pages are mapped without the write permission; on the first
+    // write we allocate a new page, copy the contents, install the
+    // new page in the PTE and set the write bit (see cowalloc()).
+    // If the fault cannot be fixed, kill the process.
+    uint64 fault_addr = r_stval();
+    if(cowalloc(p->pagetable, fault_addr) == 0){
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      p->killed = 1;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
