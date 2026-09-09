@@ -3,6 +3,8 @@
 #include "memlayout.h"
 #include "elf.h"
 #include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
 #include "defs.h"
 #include "fs.h"
 
@@ -95,6 +97,43 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   return &pagetable[PX(0, va)];
 }
 
+// Allocate a zero-filled page on demand and map it into the calling
+// process at the page containing user virtual address va.
+// This is the heart of lazy allocation: sbrk() only promises the
+// memory (by increasing p->sz); the actual page is allocated here,
+// the first time the process touches the address.
+// Returns 0 on success, -1 on failure.  A failure occurs if
+//  - va is outside the address space or >= p->sz (not promised),
+//  - the page is already mapped (e.g., stack guard page or write to
+//    a read-only page: a protection fault, not a lazy fault), or
+//  - the kernel is out of memory.
+// Callers (usertrap() in trap.c and the copyin/copyout machinery)
+// must kill the process or fail the operation when this returns -1.
+int
+lazyalloc(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  char *mem;
+  uint64 pa;
+
+  if(va >= MAXVA)
+    return -1;
+  pa = PGROUNDDOWN(va);
+  if(pa >= p->sz)
+    return -1;
+  if((pte = walk(p->pagetable, va, 0)) != 0 && (*pte & PTE_V))
+    return -1;
+  if((mem = kalloc()) == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+  if(mappages(p->pagetable, pa, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+    kfree(mem);
+    return -1;
+  }
+  return 0;
+}
+
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
 // Can only be used to look up user pages.
@@ -108,10 +147,20 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  if(pte == 0)
-    return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
+  if(pte == 0 || (*pte & PTE_V) == 0){
+    // The page is not mapped.  If the system call is accessing the
+    // current process's own address space, this may be a page that
+    // sbrk() allocated lazily but that has not been touched yet
+    // (e.g., the buffer of a read()/write() system call).  Allocate
+    // and map it on demand so that such system calls work.
+    // Anything outside [0, p->sz) is not a valid lazy page.
+    struct proc *p = myproc();
+    if(pagetable != p->pagetable || lazyalloc(va) < 0)
+      return 0;
+    pte = walk(pagetable, va, 0);
+    if(pte == 0)
+      return 0;
+  }
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
@@ -174,9 +223,10 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
-// Remove mappings from a page table. The mappings in
-// the given range must exist. Optionally free the
-// physical memory.
+// Remove mappings from a page table.  Optionally free the
+// physical memory.  Since sbrk() allocates lazily, some pages
+// in the given range may never have been mapped; those pages
+// (and any missing page-table pages) are simply skipped.
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
 {
@@ -187,23 +237,27 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
   for(;;){
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0){
-      printf("va=%p pte=%p\n", a, *pte);
-      panic("uvmunmap: not mapped");
+    if((pte = walk(pagetable, a, 0)) == 0){
+      // no page-table pages at all for this address: the whole
+      // 2MB block it belongs to is unmapped; skip the block.
+      a = (a + 512 * PGSIZE) & ~(512 * PGSIZE - 1);
+    } else {
+      if((*pte & PTE_V) == 0){
+        // lazily allocated but never touched page: nothing to unmap.
+        a += PGSIZE;
+      } else {
+        if(PTE_FLAGS(*pte) == PTE_V)
+          panic("uvmunmap: not a leaf");
+        if(do_free){
+          pa = PTE2PA(*pte);
+          kfree((void*)pa);
+        }
+        *pte = 0;
+        a += PGSIZE;
+      }
     }
-    if(PTE_FLAGS(*pte) == PTE_V)
-      panic("uvmunmap: not a leaf");
-    if(do_free){
-      pa = PTE2PA(*pte);
-      kfree((void*)pa);
-    }
-    *pte = 0;
-    if(a == last)
+    if(a > last)
       break;
-    a += PGSIZE;
-    pa += PGSIZE;
   }
 }
 
@@ -314,6 +368,10 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // its memory into a child's page table.
 // Copies both the page table and the
 // physical memory.
+// With lazy allocation some of the parent's pages
+// (within p->sz) may not be mapped yet; those pages
+// are left unmapped in the child as well, and the
+// child will allocate them lazily on first touch.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -325,10 +383,15 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+    if((pte = walk(old, i, 0)) == 0){
+      // no page-table pages for this address at all: the whole
+      // 2MB block it belongs to is unmapped; leave it unmapped
+      // (the for-loop's i += PGSIZE lands on the next block).
+      i = ((i + 512 * PGSIZE) & ~(512 * PGSIZE - 1)) - PGSIZE;
+      continue;
+    }
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;   // lazily allocated but never touched: leave unmapped
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
