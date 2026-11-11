@@ -95,33 +95,69 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(struct mbuf *m)
 {
-  //
-  // Your code here.
-  //
-  // the mbuf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after sending.
-  //
-  return -1;
+  acquire(&e1000_lock);
+  uint i = regs[E1000_TDT];
+  volatile struct tx_desc *desc = &tx_ring[i];
+  if (!(desc->status & E1000_TXD_STAT_DD)) {
+    release(&e1000_lock);
+    return -1;
+  }
+  __sync_synchronize();
+
+  if (tx_mbufs[i])
+    mbuffree(tx_mbufs[i]);
+  tx_mbufs[i] = m;
+  desc->addr = (uint64)m->head;
+  desc->length = m->len;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
+  desc->status = 0;
+  // Publish the descriptor and packet before notifying the device.
+  __sync_synchronize();
+  regs[E1000_TDT] = (i + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
+  return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+  for (;;) {
+    acquire(&e1000_lock);
+    uint i = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    volatile struct rx_desc *desc = &rx_ring[i];
+    if (!(desc->status & E1000_RXD_STAT_DD)) {
+      release(&e1000_lock);
+      return;
+    }
+    __sync_synchronize();
+
+    struct mbuf *m = 0;
+    if (!desc->errors && (desc->status & E1000_RXD_STAT_EOP) &&
+        desc->length <= MBUF_SIZE) {
+      struct mbuf *replacement = mbufalloc(0);
+      if (replacement) {
+        m = rx_mbufs[i];
+        mbufput(m, desc->length);
+        rx_mbufs[i] = replacement;
+        desc->addr = (uint64)replacement->head;
+      }
+    }
+    // On allocation failure or a bad frame, drop it and reuse its buffer.
+    desc->status = 0;
+    __sync_synchronize();
+    regs[E1000_RDT] = i;
+    release(&e1000_lock);
+
+    // ARP handling can transmit, so do not hold the driver lock here.
+    if (m)
+      net_rx(m);
+  }
 }
 
 void
 e1000_intr(void)
 {
-  e1000_recv();
-  // tell the e1000 we've seen this interrupt;
-  // without this the e1000 won't raise any
-  // further interrupts.
+  // Acknowledge first so packets arriving during the drain can interrupt again.
   regs[E1000_ICR];
+  e1000_recv();
 }
