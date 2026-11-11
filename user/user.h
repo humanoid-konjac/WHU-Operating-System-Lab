@@ -23,7 +23,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
-int ntas();
+int ntas(int);
 int crash(const char*, int);
 int mount(char*, char *);
 int umount(char*);

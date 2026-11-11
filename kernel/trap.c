@@ -163,7 +163,8 @@ void
 clockintr()
 {
   acquire(&tickslock);
-  ticks++;
+  // Buffer-cache timestamps read ticks without taking tickslock.
+  __atomic_fetch_add(&ticks, 1, __ATOMIC_RELAXED);
   wakeup(&ticks);
   release(&tickslock);
 }

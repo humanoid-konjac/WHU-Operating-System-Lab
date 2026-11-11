@@ -1,6 +1,6 @@
 // Buffer cache.
 //
-// The buffer cache is a linked list of buf structures holding
+// The buffer cache is a hash table of buf structures holding
 // cached copies of disk block contents.  Caching disk blocks
 // in memory reduces the number of disk reads and also provides
 // a synchronization point for disk blocks used by multiple processes.
@@ -23,13 +23,17 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
-  struct buf buf[NBUF];
+#define NBUCKET 13
 
-  // Linked list of all buffers, through prev/next.
-  // head.next is most recently used.
-  struct buf head;
+struct bucket {
+  struct spinlock lock;       // protects the chain and buffer metadata
+  struct buf *head;
+};
+
+struct {
+  struct spinlock lock;      // serializes cache misses and buffer moves
+  struct bucket bucket[NBUCKET];
+  struct buf buf[NBUF];
 } bcache;
 
 void
@@ -38,52 +42,114 @@ binit(void)
   struct buf *b;
 
   initlock(&bcache.lock, "bcache");
+  for(int i = 0; i < NBUCKET; i++)
+    initlock(&bcache.bucket[i].lock, "bcache.bucket");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
+  // Unassigned buffers have no valid device and start in bucket zero.
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
+    b->dev = -1;
+    b->next = bcache.bucket[0].head;
+    bcache.bucket[0].head = b;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
   }
 }
 
-// Look through buffer cache for block on device dev.
-// If not found, allocate a buffer.
-// In either case, return locked buffer.
+// Caller holds the block's bucket lock.
+static struct buf*
+blookup(uint dev, uint blockno)
+{
+  for(struct buf *b = bcache.bucket[blockno % NBUCKET].head; b; b = b->next)
+    if(b->dev == dev && b->blockno == blockno)
+      return b;
+  return 0;
+}
+
+// Caller holds bcache.lock and has checked that the block is not cached.
+static struct buf*
+brecycle(uint dev, uint blockno)
+{
+  struct buf *victim = 0;
+  struct bucket *src = 0;
+  uint oldest = 0;
+
+  // Retain the best candidate's lock so it cannot be claimed during the scan.
+  // Only this serialized path holds two bucket locks at once.
+  for(int i = 0; i < NBUCKET; i++){
+    struct bucket *bucket = &bcache.bucket[i];
+    int selected = 0;
+    acquire(&bucket->lock);
+    for(struct buf *b = bucket->head; b; b = b->next){
+      if(b->refcnt == 0){
+        uint age = __atomic_load_n(&ticks, __ATOMIC_RELAXED) - b->lastuse;
+        if(b->dev == (uint)-1)
+          age = ~0U; // use unassigned buffers before evicting cached blocks
+        if(victim == 0 || age > oldest){
+          victim = b;
+          oldest = age;
+          selected = 1;
+        }
+      }
+    }
+    if(selected){
+      if(src)
+        release(&src->lock);
+      src = bucket;
+    } else {
+      release(&bucket->lock);
+    }
+  }
+
+  if(victim == 0)
+    panic("bget: no buffers");
+
+  struct bucket *dst = &bcache.bucket[blockno % NBUCKET];
+  if(src != dst){
+    acquire(&dst->lock);
+    struct buf **link = &src->head;
+    while(*link != victim)
+      link = &(*link)->next;
+    *link = victim->next;
+    victim->next = dst->head;
+    dst->head = victim;
+  }
+  victim->dev = dev;
+  victim->blockno = blockno;
+  victim->valid = 0;
+  victim->refcnt = 1;
+  if(src != dst)
+    release(&dst->lock);
+  release(&src->lock);
+  return victim;
+}
+
+// Return a referenced, sleep-locked buffer for this device and block.
 static struct buf*
 bget(uint dev, uint blockno)
 {
+  struct bucket *bucket = &bcache.bucket[blockno % NBUCKET];
   struct buf *b;
 
-  acquire(&bcache.lock);
+  acquire(&bucket->lock);
+  b = blookup(dev, blockno);
+  if(b)
+    b->refcnt++;
+  release(&bucket->lock);
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
+  if(b == 0){
+    acquire(&bcache.lock);
+    // Another miss may have installed the block while we waited.
+    acquire(&bucket->lock);
+    b = blookup(dev, blockno);
+    if(b)
       b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+    release(&bucket->lock);
+    if(b == 0)
+      b = brecycle(dev, blockno);
+    release(&bcache.lock);
   }
 
-  // Not cached; recycle an unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
-  panic("bget: no buffers");
+  acquiresleep(&b->lock);
+  return b;
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -110,7 +176,7 @@ bwrite(struct buf *b)
 }
 
 // Release a locked buffer.
-// Move to the head of the MRU list.
+// Record the last use when the buffer becomes available for recycling.
 void
 brelse(struct buf *b)
 {
@@ -119,33 +185,30 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKET];
+  acquire(&bucket->lock);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  if(b->refcnt == 0)
+    b->lastuse = __atomic_load_n(&ticks, __ATOMIC_RELAXED);
+  release(&bucket->lock);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKET];
+  acquire(&bucket->lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bucket->lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  struct bucket *bucket = &bcache.bucket[b->blockno % NBUCKET];
+  acquire(&bucket->lock);
   b->refcnt--;
-  release(&bcache.lock);
+  if(b->refcnt == 0)
+    b->lastuse = __atomic_load_n(&ticks, __ATOMIC_RELAXED);
+  release(&bucket->lock);
 }
 
 
