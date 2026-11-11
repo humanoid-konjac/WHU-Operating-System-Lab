@@ -12,6 +12,7 @@ OBJS = \
   $K/string.o \
   $K/main.o \
   $K/vm.o \
+  $K/mmap.o \
   $K/proc.o \
   $K/swtch.o \
   $K/trampoline.o \
@@ -129,6 +130,7 @@ UPROGS=\
 	$U/_ln\
 	$U/_ls\
 	$U/_mkdir\
+	$U/_mmaptest\
 	$U/_rm\
 	$U/_sh\
 	$U/_stressfs\

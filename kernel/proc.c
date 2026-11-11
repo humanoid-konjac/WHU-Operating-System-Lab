@@ -179,8 +179,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, PGSIZE, 0);
   uvmunmap(pagetable, TRAPFRAME, PGSIZE, 0);
-  if(sz > 0)
-    uvmfree(pagetable, sz);
+  uvmfree(pagetable, sz);
 }
 
 // a user program that calls exec("/init")
@@ -226,11 +225,17 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 sz;
   struct proc *p = myproc();
 
   sz = p->sz;
   if(n > 0){
+    uint64 limit = TRAPFRAME;
+    for(int i = 0; i < NVMA; i++)
+      if(p->vmas[i].file && p->vmas[i].addr < limit)
+        limit = p->vmas[i].addr;
+    if((uint64)n > limit - sz)
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
@@ -256,12 +261,23 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
-    freeproc(np);
-    release(&np->lock);
-    return -1;
-  }
+  if(uvmcopy(p->pagetable, np->pagetable, 0, p->sz) < 0)
+    goto bad;
   np->sz = p->sz;
+
+  // Copy resident mapping pages as well, preserving private modifications.
+  // Missing pages remain lazy in the child.
+  for(i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(v->file && uvmcopy(p->pagetable, np->pagetable, v->addr,
+                         v->addr + PGROUNDUP(v->length)) < 0)
+      goto bad;
+  }
+  for(i = 0; i < NVMA; i++)
+    if(p->vmas[i].file){
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].file = filedup(p->vmas[i].file);
+    }
 
   np->parent = p;
 
@@ -286,6 +302,14 @@ fork(void)
   release(&np->lock);
 
   return pid;
+
+bad:
+  for(i = 0; i < NVMA; i++)
+    if(p->vmas[i].file)
+      uvmunmap(np->pagetable, p->vmas[i].addr, PGROUNDUP(p->vmas[i].length), 1);
+  freeproc(np);
+  release(&np->lock);
+  return -1;
 }
 
 // Pass p's abandoned children to init.
@@ -324,6 +348,8 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  vmafree(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

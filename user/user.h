@@ -23,6 +23,8 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+void* mmap(void*, uint64, int, int, int, uint64);
+int munmap(void*, uint64);
 int ntas();
 int crash(const char*, int);
 int mount(char*, char *);
