@@ -23,6 +23,8 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int sigalarm(int, void (*)(void));
+int sigreturn(void);
 int ntas();
 int crash(const char*, int);
 int mount(char*, char *);

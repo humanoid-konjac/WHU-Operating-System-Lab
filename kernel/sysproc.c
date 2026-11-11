@@ -95,3 +95,32 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sigalarm(void)
+{
+  int interval;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  if(argint(0, &interval) < 0 || argaddr(1, &handler) < 0 || interval < 0)
+    return -1;
+  p->alarm.interval = interval;
+  p->alarm.handler = handler;
+  p->alarm.ticks = 0;
+  // Reconfiguring an alarm must not discard an active handler's saved state.
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+
+  if(!p->alarm.active)
+    return -1;
+  *p->tf = p->alarm.saved;
+  p->alarm.active = 0;
+  // syscall() writes its return value to a0; preserve the interrupted value.
+  return p->tf->a0;
+}

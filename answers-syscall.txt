@@ -1,0 +1,40 @@
+以下地址依据本次使用 riscv64-unknown-elf-gcc 16.1.0、项目默认 -O 选项
+编译得到的 user/call.asm；编译器或链接内容变化后，地址可能不同。
+
+1. 哪些寄存器传递参数？13 存在哪里？
+   整数和指针参数首先使用 a0-a7，超出寄存器容量的参数通过栈传递。
+   main 调用 printf 时，a0 是格式字符串，a1 是 f(8)+1，即 12，
+   a2 是 13。对应指令位于 0x2c：li a2,13。
+
+2. main 在哪里调用 f 和 g？
+   main 从 0x24 开始，其中没有调用 f 或 g 的跳转指令。
+   编译器已将它们内联并把 f(8)+1 折叠为常量 12，直接在 0x2e
+   执行 li a1,12。独立的 f 位于 0x12，g 位于 0x0；f 内也没有
+   调用 g，而是在 0x1a 直接执行 addiw a0,a0,3。
+
+3. printf 的地址是什么？
+   用户态 printf 位于 0x66c。main 在 0x38 执行 auipc ra,0，
+   随后在 0x3c 执行 jalr 1588(ra)，跳转到该地址。
+
+4. 跳转到 printf 后，ra 的值是什么？
+   ra 为 0x40，即 0x3c 处这条四字节 jalr 的下一条指令地址。
+   jalr 用旧 ra 计算目标，再把自身地址加 4 写入 ra。
+
+5. thread_switch 为什么只需要保存被调用者保存寄存器？
+   这里的切换由普通函数调用主动触发，编译器会按 ABI 处理调用者
+   保存寄存器中的活跃值。切换函数需要保存 s0-s11，并额外记录
+   sp 和 ra，以便恢复线程的栈和调用返回位置。gp、tp 在这些线程间
+   共用且不修改；新线程的 sp 按 ABI 对齐到 16 字节，ra 指向入口函数。
+
+6. 闹钟为什么需要保存更多状态？
+   时钟中断可以发生在任意指令处，没有调用者替它保存临时寄存器。
+   因此保存完整 trapframe，包括所有用户整数寄存器和 epc。
+   sigreturn 恢复该现场，并返回原 a0，抵消系统调用分发器对 a0 的
+   返回值写入。usertrapret 再把 epc 写回 sepc，从被中断的位置继续。
+   active 标志保证处理函数调用 sigreturn 前不会再次进入处理函数。
+
+调用约定参考：
+https://riscv-non-isa.github.io/riscv-elf-psabi-doc/#_integer_register_convention
+https://riscv-non-isa.github.io/riscv-elf-psabi-doc/#_integer_calling_convention
+JALR 指令参考：
+https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html

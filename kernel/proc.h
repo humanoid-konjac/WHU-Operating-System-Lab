@@ -99,6 +99,13 @@ struct proc {
   uint64 sz;                   // Size of process memory (bytes)
   pagetable_t pagetable;       // Page table
   struct trapframe *tf;        // data page for trampoline.S
+  struct {
+    int interval;
+    int ticks;
+    int active;               // handler has not called sigreturn yet
+    uint64 handler;
+    struct trapframe saved;
+  } alarm;
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
